@@ -28,9 +28,10 @@
  *     (the computations are executed in root to leaf order because of the traversal order)
  */
 
-/** current capture context for identifying @reactive sources (other reactive elements)
+/** current capture context for identifying @reactive sources (other reactive elements) and cleanups
  * - active while evaluating a reactive function body  */
 let CurrentReaction: Reactive<any> | undefined = undefined;
+let CurrentGets: Reactive<any>[] = [];
 
 /** reactive nodes are marked dirty when their source values change TBD*/
 const CacheCurrent = 0; // reactive value is valid, no need to recompute
@@ -54,7 +55,7 @@ export class Reactive<T> {
   private value: T;
   private fn?: () => T;
   private observers?: Set<Reactive<any>>;
-  private sources?: Set<Reactive<any>>;
+  private rawSources?: Reactive<any>[]; // sources in reference order, not deduplicated
   private state: CacheState = CacheDirty;
   cleanups: ((oldValue: T) => void)[] = [];
 
@@ -69,12 +70,7 @@ export class Reactive<T> {
   }
 
   get(): T {
-    if (CurrentReaction) {
-      if (!CurrentReaction.sources) CurrentReaction.sources = new Set();
-      CurrentReaction.sources.add(this);
-      if (!this.observers) this.observers = new Set();
-      this.observers.add(CurrentReaction);
-    }
+    CurrentGets.push(this);
     if (this.fn) this.updateIfNecessary();
     return this.value;
   }
@@ -95,16 +91,29 @@ export class Reactive<T> {
 
   /** run the computation fn, updating the cached value */
   private update(): boolean {
-    if (this.sources) {
-      this.sources.forEach((x) => x.observers?.delete(this));
-      this.sources.clear();
-    }
-
     const oldValue = this.value;
     withCurrentCompute(this, () => {
       this.cleanups.forEach((c) => c(this.value));
       this.cleanups = [];
       this.value = this.fn!();
+
+      // if the sources have changed, update source & observer links
+      if (!arrayEq(CurrentGets, this.rawSources)) {
+        // update source up links
+        const { rawSources: oldSources } = this;
+        this.rawSources = CurrentGets;
+        if (oldSources) {
+          oldSources.forEach((s) => s.observers?.delete(this));
+        }
+
+        // update observer down links
+        CurrentGets.forEach((source) => {
+          if (!source.observers) {
+            source.observers = new Set();
+          }
+          source.observers.add(this);
+        });
+      }
     });
     this.state = CacheCurrent;
 
@@ -123,9 +132,9 @@ export class Reactive<T> {
     }
 
     if (this.state == CacheCheck) {
-      if (this.sources) {
+      if (this.rawSources) {
         let updated = false;
-        for (const source of this.sources) {
+        for (const source of this.rawSources) {
           updated ||= source.updateIfNecessary();
         }
         if (updated) {
@@ -142,12 +151,16 @@ export class Reactive<T> {
 
 /* Evalute the reactive function body, dynamically capturing any other reactives used */
 function withCurrentCompute(reactive: Reactive<any>, fn: () => any): any {
-  const listener = CurrentReaction;
+  const prevReaction = CurrentReaction;
+  const prevGets = CurrentGets;
+
   CurrentReaction = reactive;
+  CurrentGets = [];
   try {
     return fn();
   } finally {
-    CurrentReaction = listener;
+    CurrentGets = prevGets;
+    CurrentReaction = prevReaction;
   }
 }
 
@@ -157,4 +170,13 @@ export function onCleanup<T = any>(fn: (oldValue: T) => void): void {
   } else {
     console.error("onCleanup must be called from within a @reactive function");
   }
+}
+
+function arrayEq<T>(a: T[], b: T[] | undefined): boolean {
+  if (!b) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
